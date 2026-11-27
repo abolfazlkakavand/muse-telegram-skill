@@ -51,21 +51,24 @@ class TestWatch(W):
         self.assertEqual((res["event"], res["count"], res["ack_upto"]), ("messages", 1, 10))
         self.assertNotIn("spam", json.dumps(res))
         self.assertTrue(os.path.exists(tg.spath("watchman.heartbeat")))
-        self.assertEqual(tg.load_state()["offset"], 10)
+        st = tg.load_state()
+        self.assertEqual(st["offset"], 12)            # Telegram is confirmed at once
+        self.assertEqual(list(st["delivered"]), ["10"])  # the inbox keeps the message
         code, res, _ = self.run_cli("ack", "--upto", "10")
         self.assertEqual(res["acked"], 1)
         st = tg.load_state()
-        self.assertEqual((st["offset"], st["session"]["handled"]), (11, 1))
+        self.assertEqual((st["offset"], st["delivered"], st["session"]["handled"]),
+                         (12, {}, 1))
 
     def test_owner_recorded_on_pairing(self):
         self.pair()
         self.assertEqual(tg.load_state()["owners"], [111])
 
-    def test_junk_before_pending_is_confirmed(self):
+    def test_everything_fetched_is_confirmed_immediately(self):
         self.pair()
         self.fake.updates += [msg(5, 222, "x"), msg(6, 111, "hi"), msg(7, 222, "y")]
         self.watch()
-        self.assertEqual(tg.load_state()["offset"], 6)
+        self.assertEqual(tg.load_state()["offset"], 8)
 
     def test_lease_blocks_redelivery_then_expires_then_drops(self):
         self.pair()
@@ -105,7 +108,7 @@ class TestWatch(W):
         self.fake.script = [[msg(10, 111, "one")], [msg(11, 111, "two")]]
         _, res, _ = self.watch()
         self.assertEqual((res["count"], res["ack_upto"]), (2, 11))
-        self.assertEqual(tg.load_state()["offset"], 10)
+        self.assertEqual(tg.load_state()["offset"], 12)
 
     def test_status_and_help_are_native(self):
         self.pair()
