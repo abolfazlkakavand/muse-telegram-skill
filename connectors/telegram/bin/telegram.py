@@ -912,7 +912,7 @@ def cmd_doctor(a):
 
 
 # --------------------------------------------------------------------------
-# v2: watchman, delivery leases, owner commands, watchdog logic, sessions
+# v2: watchman, local inbox, owner commands, watchdog logic, sessions
 # --------------------------------------------------------------------------
 try:
     import fcntl
@@ -920,9 +920,9 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 DEFAULT_CONFIG = {"rotate_after": 50, "ack": "typing", "batch_wait": 3,
-                  "lease_seconds": 180, "max_errors": 12, "memory_max_chars": 3500}
+                  "lease_seconds": 600, "max_errors": 12, "memory_max_chars": 3500}
 CONFIG_RULES = {"rotate_after": (10, 500), "batch_wait": (0, 10),
-                "lease_seconds": (60, 900), "max_errors": (3, 100),
+                "lease_seconds": (60, 1800), "max_errors": (3, 100),
                 "memory_max_chars": (1000, 8000)}
 MAX_DELIVERIES = 3
 HB_STALE = 120
@@ -1100,7 +1100,6 @@ def _ack(upto):
             del st["delivered"][k]
         s["handled"] += len(done)
         st["offset"] = max(st["offset"], upto + 1)
-        st["done"] = [x for x in st["done"] if x >= st["offset"]]
         save_state(st)
     log_event("ack", upto=upto, messages=len(done))
     limit = cfg(st, "rotate_after")
@@ -1109,51 +1108,65 @@ def _ack(upto):
 
 
 def _apply(updates):
-    """Classify updates under the state lock.
+    """Store new paired-chat messages in the local inbox and confirm every
+    fetched update to Telegram in ONE atomic state write.
 
-    Returns (fresh, natives, dropped, paired). `fresh` messages are leased so
-    a second watchman never delivers them again while Muse is replying.
+    Because the inbox holds the message text, Telegram never has to send it
+    again: no re-delivery after an ack, no busy loop while Muse is replying,
+    and a stale in-flight response (update id below the offset) is ignored.
+    Returns (new_messages, owner_commands, newly_paired_chats).
     """
-    now = time.time()
-    fresh, natives, dropped = [], [], []
+    new, natives = [], []
     with state_lock():
         st = load_state()
+        offset = st["offset"]
+        updates = [u for u in updates if int(u.get("update_id", 0)) >= offset]
         msgs, _ignored, paired = process_updates(st, updates, False, 4000)
         owners = _owner_ids(st)
-        lease = cfg(st, "lease_seconds")
-        pending = {int(k) for k in st["delivered"]}   # outstanding from earlier batches
         for m in msgs:
-            uid = m["update_id"]
-            if uid in st["done"]:
-                continue
             cmd = _OWNER_CMD_RE.match(m["text"].strip()) \
                 if m["from"]["id"] in owners else None
             if cmd and cmd.group(1) != "new":
-                st["done"].append(uid)
                 natives.append((cmd.group(1), m))
                 continue
             if cmd:
                 m["owner_command"] = "new"
-            d = st["delivered"].get(str(uid))
-            if d and d["until"] > now:
-                pending.add(uid)
-                continue
-            n = d["n"] + 1 if d else 1
-            if n > MAX_DELIVERIES:
-                st["delivered"].pop(str(uid), None)
-                st["done"].append(uid)
-                dropped.append(m)
-                continue
-            st["delivered"][str(uid)] = {"n": n, "until": now + lease}
-            pending.add(uid)
-            fresh.append(m)
+            st["delivered"][str(m["update_id"])] = {"msg": m, "n": 0, "until": 0}
+            new.append(m)
         ids = [int(u.get("update_id", 0)) for u in updates]
         if ids:
-            st["offset"] = max(st["offset"],
-                               min(pending) if pending else max(ids) + 1)
-        st["done"] = [x for x in st["done"] if x >= st["offset"]][-200:]
+            st["offset"] = max(offset, max(ids) + 1)
         save_state(st)
-    return fresh, natives, dropped, paired
+    return new, natives, paired
+
+
+def _due():
+    """Inbox messages ready for Muse: new ones and ones whose lease expired.
+
+    Each is leased so a second watchman never hands it over twice while Muse
+    is replying. After MAX_DELIVERIES unacknowledged hand-overs it is dropped.
+    """
+    now = time.time()
+    due, dropped = [], []
+    with state_lock():
+        st = load_state()
+        lease = cfg(st, "lease_seconds")
+        for k in sorted(st["delivered"], key=int):
+            d = st["delivered"][k]
+            if "msg" not in d:                    # legacy entry from an older version
+                del st["delivered"][k]
+                continue
+            if d["until"] > now:
+                continue
+            if d["n"] >= MAX_DELIVERIES:
+                dropped.append(d["msg"])
+                del st["delivered"][k]
+                continue
+            d["n"] += 1
+            d["until"] = now + lease
+            due.append(d["msg"])
+        save_state(st)
+    return due, dropped
 
 
 def _effects(fresh, natives, dropped, paired, ack_mode):
@@ -1210,6 +1223,67 @@ def _lock_watch():
     return fh
 
 
+def _deliver():
+    """Hand due inbox messages to Muse by printing them. True if printed."""
+    due, dropped = _due()
+    _effects([], [], dropped, [], "none")
+    if not due:
+        return False
+    with state_lock():
+        st = load_state()
+        s = _session(st)
+        save_state(st)
+    limit = cfg(st, "rotate_after")
+    log_event("deliver", messages=len(due))
+    out({"ok": True, "event": "messages", "untrusted_content": True,
+         "notice": UNTRUSTED_NOTICE, "count": len(due), "messages": due,
+         "ack_upto": max(m["update_id"] for m in due),
+         "lease_seconds": cfg(st, "lease_seconds"),
+         "session": {"handled": s["handled"], "rotate_after": limit,
+                     "should_rotate": s["handled"] + len(due) >= limit
+                     or any(m.get("owner_command") for m in due)},
+         "next": "Start a new `watch` first, reply, then ack with "
+                 "`send --ack-upto N` (or `ack --upto N`). For long jobs "
+                 "run `lease --upto N` every few minutes."})
+    return True
+
+
+def _step(updates):
+    """Handle one batch of updates. Returns True when an event was printed."""
+    new, natives, paired = _apply(updates)
+    open(spath("watchman.heartbeat"), "a").close()   # only after a clean batch
+    os.utime(spath("watchman.heartbeat"), None)
+    st = load_state()
+    mode = cfg(st, "ack")
+    stop = _effects(new, natives, [], paired, mode)
+    if new and not stop and cfg(st, "batch_wait") > 0:
+        try:
+            more = _fetch(min(cfg(st, "batch_wait"), 10))
+        except CliError:
+            more = []
+        n2, nat2, p2 = _apply(more)
+        stop = _effects(n2, nat2, [], p2, mode)
+    if stop:
+        with open(spath("watchman.stopped"), "w") as fh:
+            fh.write(iso(time.time()))
+        log_event("stopped_by_owner")
+        out({"ok": True, "event": "stopped",
+             "next": "Disable the watchdog hook. Do not restart."})
+        return True
+    return _deliver()
+
+
+def _crash_exit(exc):
+    detail = scrub(f"{type(exc).__name__}: {exc}")[:200]
+    log_event("crash", error=type(exc).__name__)
+    _health(False, detail, 1)
+    out({"ok": False, "event": "unhealthy", "error": detail,
+         "consecutive_errors": 1,
+         "next": "Run `doctor`, tell the user what failed, "
+                 "and do not restart in a loop."})
+    sys.exit(EXIT_UNHEALTHY)
+
+
 def cmd_watch(a):
     lock = _lock_watch()
     mine = str(os.getpid())
@@ -1233,6 +1307,11 @@ def cmd_watch(a):
                 out({"ok": True, "event": "idle"})
                 return
             try:
+                if _deliver():       # leftovers from a /stop, expired leases
+                    return
+            except Exception as exc:  # never die silently
+                _crash_exit(exc)
+            try:
                 updates = _fetch(25)
             except CliError as exc:
                 errors += 1
@@ -1249,44 +1328,11 @@ def cmd_watch(a):
                 continue
             errors = 0
             _health(True)
-            open(spath("watchman.heartbeat"), "a").close()
-            os.utime(spath("watchman.heartbeat"), None)
-            fresh, natives, dropped, paired = _apply(updates)
-            st = load_state()
-            stop = _effects(fresh, natives, dropped, paired, cfg(st, "ack"))
-            if fresh and not stop and cfg(st, "batch_wait") > 0:
-                try:
-                    more = _fetch(min(cfg(st, "batch_wait"), 10))
-                except CliError:
-                    more = []
-                f2, n2, d2, p2 = _apply(more)
-                stop = _effects(f2, n2, d2, p2, cfg(st, "ack"))
-                fresh += f2
-            if stop:
-                with open(spath("watchman.stopped"), "w") as fh:
-                    fh.write(iso(time.time()))
-                log_event("stopped_by_owner")
-                out({"ok": True, "event": "stopped",
-                     "next": "Disable the watchdog hook. Do not restart."})
-                return
-            if fresh:
-                with state_lock():
-                    st = load_state()
-                    s = _session(st)
-                    save_state(st)
-                limit = cfg(st, "rotate_after")
-                log_event("deliver", messages=len(fresh))
-                out({"ok": True, "event": "messages", "untrusted_content": True,
-                     "notice": UNTRUSTED_NOTICE, "count": len(fresh),
-                     "messages": fresh,
-                     "ack_upto": max(m["update_id"] for m in fresh),
-                     "lease_seconds": cfg(st, "lease_seconds"),
-                     "session": {"handled": s["handled"], "rotate_after": limit,
-                                 "should_rotate": s["handled"] + len(fresh) >= limit
-                                 or any(m.get("owner_command") for m in fresh)},
-                     "next": "Start a new `watch` first, reply, then ack with "
-                             "`send --ack-upto N` (or `ack --upto N`)."})
-                return
+            try:
+                if _step(updates):
+                    return
+            except Exception as exc:  # never die silently
+                _crash_exit(exc)
     finally:
         try:
             with open(spath("watchman.pid")) as fh:
@@ -1299,6 +1345,20 @@ def cmd_watch(a):
 
 def cmd_ack(a):
     out(dict(ok=True, **_ack(a.upto)))
+
+
+def cmd_lease(a):
+    now = time.time()
+    with state_lock():
+        st = load_state()
+        extra = cfg(st, "lease_seconds")
+        n = 0
+        for k, d in st["delivered"].items():
+            if int(k) <= a.upto:
+                d["until"] = now + extra
+                n += 1
+        save_state(st)
+    out({"ok": True, "extended": n, "seconds": extra})
 
 
 def cmd_stop(a):
@@ -1321,8 +1381,10 @@ def decide_hook(now, dry, reset=False):
     os.makedirs(hdir, mode=0o700, exist_ok=True)
     hpath = os.path.join(hdir, "state.json")
     if reset:
-        _unlink(hpath)
-        return {"action": "reset", "reason": "state cleared", "details": {}}
+        if not dry:
+            _unlink(hpath)
+        return {"action": "reset", "details": {},
+                "reason": "dry run: nothing cleared" if dry else "state cleared"}
     hs = _read_json_file(hpath, {})
     hs.setdefault("restarts", [])
     hs.setdefault("failures", 0)
@@ -1393,7 +1455,8 @@ def cmd_session(a):
         log_event("rotate_end", session=st["session"]["id"])
     st = load_state()
     out({"ok": True, "session": gather_status()["session"],
-         "grace_seconds": ROTATE_GRACE})
+         "grace_seconds": ROTATE_GRACE,
+         "watchman_still_running": _watch_pid() is not None})
 
 
 def cmd_memory(a):
@@ -1563,6 +1626,8 @@ def build_parser():
     sp = add("watch", cmd_watch, "listen; exit when paired-chat messages arrive")
     sp.add_argument("--max-loops", type=int, default=0, help=argparse.SUPPRESS)
     sp = add("ack", cmd_ack, "mark delivered messages as handled")
+    sp.add_argument("--upto", type=int, required=True)
+    sp = add("lease", cmd_lease, "extend the lease of delivered messages (long jobs)")
     sp.add_argument("--upto", type=int, required=True)
     add("stop", cmd_stop, "stop the watchman; the watchdog stays quiet")
     add("status", cmd_status, "watchman, session and hook status")
