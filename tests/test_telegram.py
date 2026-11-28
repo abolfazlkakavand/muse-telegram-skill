@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -89,9 +90,15 @@ class FakeTG:
         return True
 
 
-def msg(uid, chat, text, **extra):
-    m = {"message_id": uid, "chat": {"id": chat, "type": "private"},
-         "from": {"id": chat, "first_name": "Ali"}, "date": 1700000000, "text": text}
+def msg(uid, chat, text, sender=None, **extra):
+    """A Telegram update. The sender is separate from the chat: in a group the
+    chat id is negative and the sender's user id is a different, positive number."""
+    if sender is None:
+        sender = chat if chat > 0 else 777
+    m = {"message_id": uid,
+         "chat": {"id": chat, "type": "private" if chat > 0 else "supergroup"},
+         "from": {"id": sender, "first_name": "Ali"}, "date": 1700000000,
+         "text": text}
     m.update(extra)
     return {"update_id": uid, "message": m}
 
@@ -106,7 +113,9 @@ class Base(unittest.TestCase):
         self.fake = FakeTG()
         tg._open = self.fake.open
         tg._dc = None
-        tg.time.sleep = lambda s: None
+        patcher = mock.patch.object(tg.time, "sleep", lambda s: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -125,10 +134,10 @@ class Base(unittest.TestCase):
                 return None
         return code, j(o.getvalue()), j(e.getvalue())
 
-    def pair(self, chat=111, uid=1):
+    def pair(self, chat=111, uid=1, sender=None):
         code, res, _ = self.run_cli("pair")
         self.assertEqual(code, 0)
-        self.fake.updates.append(msg(uid, chat, f"/pair {res['code']}"))
+        self.fake.updates.append(msg(uid, chat, f"/pair {res['code']}", sender=sender))
         code, res2, _ = self.run_cli("pair-wait", "--seconds", "5")
         self.assertEqual(code, 0, res2)
         self.assertEqual(res2["paired_chat_ids"], [chat])
@@ -145,14 +154,28 @@ class TestCore(Base):
         self.assertEqual(res["allowed_chats"], [111])
         self.assertTrue(any("Paired" in s["text"] for s in self.fake.sent))
 
-    def test_wrong_code_five_times_invalidates(self):
-        self.run_cli("pair")
+    def test_wrong_codes_are_limited_per_chat_so_a_stranger_cannot_burn_the_code(self):
+        _, res, _ = self.run_cli("pair")
+        real = res["code"]
+        wrong = "11111111" if real != "11111111" else "22222222"
+        for i in range(8):
+            self.fake.updates.append(msg(i + 1, 999, f"/pair {wrong}"))
+        self.fake.updates.append(msg(20, 111, f"/pair {real}"))
+        code, res2, _ = self.run_cli("pair-wait", "--seconds", "5")
+        self.assertEqual((code, res2["paired_chat_ids"]), (0, [111]))
+        self.assertEqual(tg.load_state()["allowed_chats"], [111])
+
+    def test_wrong_code_five_times_from_one_chat_is_then_ignored_for_that_chat(self):
+        _, res, _ = self.run_cli("pair")
+        real = res["code"]
+        wrong = "11111111" if real != "11111111" else "22222222"
         for i in range(5):
-            self.fake.updates.append(msg(i + 1, 999, "/pair 00000000"))
-        self.run_cli("poll")
+            self.fake.updates.append(msg(i + 1, 999, f"/pair {wrong}"))
+        self.fake.updates.append(msg(10, 999, f"/pair {real}"))   # right code, too late
+        self.run_cli("pair-wait", "--seconds", "1")
         st = tg.load_state()
-        self.assertIsNone(st["pair"])
         self.assertEqual(st["allowed_chats"], [])
+        self.assertIsNotNone(st["pair"])
 
     def test_unpaired_chat_text_never_returned(self):
         self.pair()

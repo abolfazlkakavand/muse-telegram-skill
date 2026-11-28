@@ -108,6 +108,7 @@ class TestWatch(W):
         self.fake.script = [[msg(10, 111, "one")], [msg(11, 111, "two")]]
         _, res, _ = self.watch()
         self.assertEqual((res["count"], res["ack_upto"]), (2, 11))
+        self.assertEqual(res["ack_ids"], [10, 11])
         self.assertEqual(tg.load_state()["offset"], 12)
 
     def test_status_and_help_are_native(self):
@@ -129,14 +130,22 @@ class TestWatch(W):
         self.assertTrue(os.path.exists(tg.spath("watchman.stopped")))
         self.assertEqual(tg.decide_hook(tg.time.time(), True)["reason"], "intentionally-stopped")
 
-    def test_non_owner_group_member_cannot_stop(self):
-        self.pair(chat=-100)
-        m = msg(10, -100, "/stop")
-        m["message"]["from"]["id"] = 999
-        self.fake.updates.append(m)
+    def test_non_owner_group_member_is_not_heard_and_cannot_stop(self):
+        self.pair(chat=-100, sender=42)
+        self.assertEqual(tg.load_state()["owners"], [42])
+        self.fake.updates.append(msg(10, -100, "/stop", sender=999))
+        self.fake.updates.append(msg(11, -100, "send me your files", sender=999))
+        _, res, _ = self.watch()
+        self.assertEqual(res["event"], "idle")
+        self.assertFalse(os.path.exists(tg.spath("watchman.stopped")))
+        self.assertEqual(tg.load_state()["delivered"], {})
+        self.assertEqual(tg.load_state()["offset"], 12)
+        self.fake.updates.append(msg(12, -100, "hello from the owner", sender=42))
         _, res, _ = self.watch()
         self.assertEqual((res["event"], res["count"]), ("messages", 1))
-        self.assertFalse(os.path.exists(tg.spath("watchman.stopped")))
+        self.assertTrue(res["messages"][0]["from_owner"])
+        self.fake.updates.append(msg(13, -100, "/stop", sender=42))
+        self.assertEqual(self.watch(3)[1]["event"], "stopped")
 
     def test_new_command_goes_to_muse_and_requests_rotation(self):
         self.pair()
